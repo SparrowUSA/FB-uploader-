@@ -4,154 +4,99 @@ import queue
 import time
 from datetime import datetime
 
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
-
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 
 # ──── Helper functions ─────────────────────────────────────────────────────
 from uploader import (
-    download_videos,
-    rename_videos,
+    rename_videos,           # we'll modify slightly
     upload_to_google_drive,
     get_drive_service
 )
 
-# ──── Configuration (all from Railway environment variables) ───────────────
+# ──── Configuration (Railway env vars) ─────────────────────────────────────
 TELEGRAM_API_ID       = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH     = os.getenv("TELEGRAM_API_HASH")
 TELETHON_BOT_TOKEN    = os.getenv("TELETHON_BOT_TOKEN")      # Bot token for Telethon
-COMMAND_BOT_TOKEN     = os.getenv("BOT_TOKEN")               # Bot token for commands
-
-ALLOWED_USER_ID       = int(os.getenv("ALLOWED_USER_ID"))    # Your Telegram numeric ID
 
 DOWNLOAD_FOLDER       = "downloads"
 VIDEO_BASE_NAME       = "My vlog"
-DELAY_BETWEEN_UPLOAD  = 60                                   # seconds — adjust if needed
+DELAY_BETWEEN_UPLOAD  = 60                                   # seconds
+
+# Global counter for sequential naming (resets on restart)
+video_counter = 0
+upload_queue = queue.Queue()
+
+# Optional: target channel username or ID (set via env or hardcode for simplicity)
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@yourchannelusername")  # or -1001234567890
 
 # ────────────────────────────────────────────────────────────────────────────
 
-async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != ALLOWED_USER_ID:
-        await update.message.reply_text("🚫 Not authorized.")
-        return
-
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text(
-            "Usage:\n"
-            "/upload @channelname 50\n"
-            "/upload -1001234567890 30"
-        )
-        return
-
-    channel_input = args[0]
-    try:
-        video_count = int(args[1])
-        if video_count < 1 or video_count > 300:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Second argument must be a number between 1–300.")
-        return
-
-    status = await update.message.reply_text(
-        f"⏳ Starting • {video_count} videos from {channel_input} …"
+def get_drive_service():
+    # same as before - load from GOOGLE_SERVICE_ACCOUNT_JSON
+    json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not json_str:
+        raise ValueError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
+    credentials_info = json.loads(json_str)
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_info, scopes=['https://www.googleapis.com/auth/drive']
     )
+    return build('drive', 'v3', credentials=credentials)
 
-    if not os.path.exists(DOWNLOAD_FOLDER):
-        os.makedirs(DOWNLOAD_FOLDER)
-
-    # Telethon client — bot mode (no session file, no phone login)
-    client = TelegramClient(
-        None,  # no session file
-        TELEGRAM_API_ID,
-        TELEGRAM_API_HASH
-    )
-
-    try:
-        await client.start(bot_token=TELETHON_BOT_TOKEN)
-
-        await status.edit_text("📥 Downloading videos (oldest → newest) …")
-
-        paths = await download_videos(client, channel_input, video_count)
-
-        if not paths:
-            await status.edit_text("No videos found in recent channel messages.")
-            return
-
-        count_downloaded = len(paths)
-        await status.edit_text(f"Downloaded {count_downloaded} videos. Renaming …")
-
-        renamed_paths = rename_videos(paths, VIDEO_BASE_NAME)
-
-        await status.edit_text(f"Starting upload to Google Drive ({count_downloaded} videos) …")
-
-        drive_service = get_drive_service()
-
-        q = queue.Queue()
-        for p in renamed_paths:
-            q.put(p)
-
-        uploaded_ok = 0
-        failed = []
-
-        while not q.empty():
-            path = q.get()
+async def process_queue():
+    """Background task to upload queued videos one by one"""
+    drive_service = get_drive_service()
+    while True:
+        if not upload_queue.empty():
+            path = upload_queue.get()
             filename = os.path.basename(path)
-
-            await status.edit_text(
-                f"Uploading {filename}  ({uploaded_ok + 1}/{count_downloaded})"
-            )
-
+            print(f"Uploading {filename} to Drive...")
             success = upload_to_google_drive(
                 path,
                 folder_id=os.getenv("DRIVE_FOLDER_ID"),
                 drive_service=drive_service
             )
-
             if success:
-                uploaded_ok += 1
                 try:
                     os.remove(path)
                 except:
                     pass
             else:
-                failed.append(filename)
-
+                print(f"Failed: {filename}")
             await asyncio.sleep(DELAY_BETWEEN_UPLOAD)
+        else:
+            await asyncio.sleep(5)  # idle check
 
-        summary = f"✅ Finished\nUploaded: {uploaded_ok}/{count_downloaded}"
-        if failed:
-            summary += "\nFailed:\n" + "\n".join(f"• {f}" for f in failed)
+@client.on(events.NewMessage(chats=TARGET_CHANNEL))
+async def video_handler(event):
+    global video_counter
+    if event.video:
+        print(f"New video detected in {TARGET_CHANNEL}")
+        path = await event.download_media(file=DOWNLOAD_FOLDER)
+        if path:
+            video_counter += 1
+            ext = os.path.splitext(path)[1] or ".mp4"
+            new_path = os.path.join(DOWNLOAD_FOLDER, f"{VIDEO_BASE_NAME} {video_counter}{ext}")
+            os.rename(path, new_path)
+            upload_queue.put(new_path)
+            print(f"Queued: {os.path.basename(new_path)} (#{video_counter})")
 
-        await status.edit_text(summary)
+async def main():
+    global client
+    client = TelegramClient(None, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
-    except Exception as e:
-        await status.edit_text(f"Error: {type(e).__name__}\n{str(e)[:500]}")
-    finally:
-        await client.disconnect()
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bot starting in event mode...")
 
+    await client.start(bot_token=TELETHON_BOT_TOKEN)
+    print("Bot authorized successfully (bot mode)")
 
-def main():
-    app = ApplicationBuilder() \
-        .token(COMMAND_BOT_TOKEN) \
-        .read_timeout(30) \
-        .write_timeout(60) \
-        .get_updates_read_timeout(30) \
-        .build()
+    # Start background upload worker
+    asyncio.create_task(process_queue())
 
-    app.add_handler(CommandHandler("upload", cmd_upload))
-
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bot started (Google Drive mode)")
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
-
+    # Keep running forever
+    print(f"Listening for new videos in: {TARGET_CHANNEL}")
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    main()
+    if not os.path.exists(DOWNLOAD_FOLDER):
+        os.makedirs(DOWNLOAD_FOLDER)
+    asyncio.run(main())
