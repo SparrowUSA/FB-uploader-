@@ -13,26 +13,25 @@ from telegram.ext import (
 
 from telethon import TelegramClient
 
-# ──── your helper functions ────────────────────────────────────────────────
+# ──── Helper functions ─────────────────────────────────────────────────────
 from uploader import (
     download_videos,
     rename_videos,
-    upload_to_facebook
+    upload_to_google_drive,
+    get_drive_service
 )
 
-# ──── Configuration from env vars (Railway) ────────────────────────────────
+# ──── Configuration (all from Railway environment variables) ───────────────
 TELEGRAM_API_ID       = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH     = os.getenv("TELEGRAM_API_HASH")
-TELETHON_BOT_TOKEN    = os.getenv("TELETHON_BOT_TOKEN")      # Bot token for Telethon downloads
-COMMAND_BOT_TOKEN     = os.getenv("BOT_TOKEN")               # Bot token for python-telegram-bot commands
-FB_PAGE_ID            = os.getenv("FB_PAGE_ID")
-FB_ACCESS_TOKEN       = os.getenv("FB_ACCESS_TOKEN")
-ALLOWED_USER_ID       = int(os.getenv("ALLOWED_USER_ID"))    # Your numeric Telegram ID
+TELETHON_BOT_TOKEN    = os.getenv("TELETHON_BOT_TOKEN")      # Bot token for Telethon
+COMMAND_BOT_TOKEN     = os.getenv("BOT_TOKEN")               # Bot token for commands
 
-SESSION_NAME          = None                                 # No session file needed in bot mode
+ALLOWED_USER_ID       = int(os.getenv("ALLOWED_USER_ID"))    # Your Telegram numeric ID
+
 DOWNLOAD_FOLDER       = "downloads"
 VIDEO_BASE_NAME       = "My vlog"
-DELAY_BETWEEN_UPLOAD  = 65                                   # seconds – safe for FB
+DELAY_BETWEEN_UPLOAD  = 60                                   # seconds — adjust if needed
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -44,8 +43,8 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     args = context.args
     if len(args) != 2:
         await update.message.reply_text(
-            "Usage examples:\n"
-            "/upload @mychannel 50\n"
+            "Usage:\n"
+            "/upload @channelname 50\n"
             "/upload -1001234567890 30"
         )
         return
@@ -56,19 +55,19 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if video_count < 1 or video_count > 300:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Second argument must be a number (1–300).")
+        await update.message.reply_text("Second argument must be a number between 1–300.")
         return
 
     status = await update.message.reply_text(
-        f"⏳ Starting • Fetching {video_count} videos from {channel_input} …"
+        f"⏳ Starting • {video_count} videos from {channel_input} …"
     )
 
     if not os.path.exists(DOWNLOAD_FOLDER):
         os.makedirs(DOWNLOAD_FOLDER)
 
-    # Telethon client in BOT mode – no phone, no session file
+    # Telethon client — bot mode (no session file, no phone login)
     client = TelegramClient(
-        SESSION_NAME,
+        None,  # no session file
         TELEGRAM_API_ID,
         TELEGRAM_API_HASH
     )
@@ -76,20 +75,22 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         await client.start(bot_token=TELETHON_BOT_TOKEN)
 
-        await status.edit_text("📥 Downloading videos (oldest first) …")
+        await status.edit_text("📥 Downloading videos (oldest → newest) …")
 
         paths = await download_videos(client, channel_input, video_count)
 
         if not paths:
-            await status.edit_text("No videos found in the recent messages of the channel.")
+            await status.edit_text("No videos found in recent channel messages.")
             return
 
         count_downloaded = len(paths)
-        await status.edit_text(f"Downloaded {count_downloaded} videos. Renaming sequentially …")
+        await status.edit_text(f"Downloaded {count_downloaded} videos. Renaming …")
 
         renamed_paths = rename_videos(paths, VIDEO_BASE_NAME)
 
-        await status.edit_text(f"Queuing uploads ({count_downloaded} videos) …")
+        await status.edit_text(f"Starting upload to Google Drive ({count_downloaded} videos) …")
+
+        drive_service = get_drive_service()
 
         q = queue.Queue()
         for p in renamed_paths:
@@ -106,7 +107,11 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"Uploading {filename}  ({uploaded_ok + 1}/{count_downloaded})"
             )
 
-            success = upload_to_facebook(path, FB_PAGE_ID, FB_ACCESS_TOKEN)
+            success = upload_to_google_drive(
+                path,
+                folder_id=os.getenv("DRIVE_FOLDER_ID"),
+                drive_service=drive_service
+            )
 
             if success:
                 uploaded_ok += 1
@@ -119,14 +124,14 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
             await asyncio.sleep(DELAY_BETWEEN_UPLOAD)
 
-        summary = f"✅ Done\nUploaded {uploaded_ok}/{count_downloaded}"
+        summary = f"✅ Finished\nUploaded: {uploaded_ok}/{count_downloaded}"
         if failed:
             summary += "\nFailed:\n" + "\n".join(f"• {f}" for f in failed)
 
         await status.edit_text(summary)
 
     except Exception as e:
-        await status.edit_text(f"Error: {type(e).__name__}\n{str(e)[:400]}")
+        await status.edit_text(f"Error: {type(e).__name__}\n{str(e)[:500]}")
     finally:
         await client.disconnect()
 
@@ -141,7 +146,7 @@ def main():
 
     app.add_handler(CommandHandler("upload", cmd_upload))
 
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bot started (bot mode)")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bot started (Google Drive mode)")
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES
