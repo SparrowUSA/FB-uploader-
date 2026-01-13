@@ -12,7 +12,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # ────────────────────────────────────────────────────────────────────────────
-# Configuration from environment variables
+# Configuration – all from environment variables
 # ────────────────────────────────────────────────────────────────────────────
 
 API_ID          = int(os.getenv("TELEGRAM_API_ID"))
@@ -32,15 +32,14 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 upload_queue = queue.Queue()
 video_counter = 0
 
-# ──── Create client at module level (before decorators) ─────────────────────
-
+# Create client globally (required for decorator)
 client = TelegramClient(
     StringSession(STRING_SESSION),
     API_ID,
     API_HASH
 )
 
-# ──── Drive service helper ──────────────────────────────────────────────────
+# ──── Google Drive helpers ──────────────────────────────────────────────────
 
 def get_drive_service():
     json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -91,6 +90,18 @@ async def upload_worker():
         else:
             await asyncio.sleep(3)
 
+# ──── Keep-alive task (forces Telegram to send channel updates) ─────────────
+
+async def channel_keep_alive():
+    while True:
+        try:
+            # Fetch last message → triggers update flow for the channel
+            await client.get_messages(TARGET_CHANNEL, limit=1)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Keep-alive: touched {TARGET_CHANNEL}")
+        except Exception as e:
+            print(f"Keep-alive failed: {e}")
+        await asyncio.sleep(300)  # 5 minutes
+
 # ──── Event handler ─────────────────────────────────────────────────────────
 
 @client.on(events.NewMessage(chats=TARGET_CHANNEL))
@@ -136,8 +147,9 @@ async def main():
     if not os.path.exists(DOWNLOAD_DIR):
         os.makedirs(DOWNLOAD_DIR)
 
-    # Start uploader in background
+    # Start background tasks
     asyncio.create_task(upload_worker())
+    asyncio.create_task(channel_keep_alive())
 
     print(f"Listening for new videos in: {TARGET_CHANNEL or 'all chats'}")
     await client.run_until_disconnected()
