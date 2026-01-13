@@ -2,7 +2,6 @@ import os
 import asyncio
 import queue
 import json
-import time
 from datetime import datetime
 
 from telethon import TelegramClient, events
@@ -11,17 +10,16 @@ from telethon.sessions import StringSession
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError
 
 # ────────────────────────────────────────────────────────────────────────────
-# Configuration – all from environment variables
+# Configuration from environment variables
 # ────────────────────────────────────────────────────────────────────────────
 
 API_ID          = int(os.getenv("TELEGRAM_API_ID"))
 API_HASH        = os.getenv("TELEGRAM_API_HASH")
-STRING_SESSION  = os.getenv("STRING_SESSION")               # the long session string
+STRING_SESSION  = os.getenv("STRING_SESSION")
 
-TARGET_CHANNEL  = os.getenv("TARGET_CHANNEL")               # @username or -100xxxxxxxxxx
+TARGET_CHANNEL  = os.getenv("TARGET_CHANNEL")               # required: @username or -100xxxxxxxxxx
 
 DOWNLOAD_DIR    = "downloads"
 BASE_NAME       = "My vlog"
@@ -34,38 +32,36 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 upload_queue = queue.Queue()
 video_counter = 0
 
+# ──── Create client at module level (before decorators) ─────────────────────
+
+client = TelegramClient(
+    StringSession(STRING_SESSION),
+    API_ID,
+    API_HASH
+)
+
+# ──── Drive service helper ──────────────────────────────────────────────────
+
 def get_drive_service():
     json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not json_str:
-        raise ValueError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
-    
+        raise ValueError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
     credentials_info = json.loads(json_str)
     credentials = service_account.Credentials.from_service_account_info(
         credentials_info, scopes=SCOPES
     )
     return build('drive', 'v3', credentials=credentials)
 
-def upload_to_drive(filepath: str, folder_id=None, service=None):
+def upload_to_drive(filepath: str):
     global video_counter
-    
-    if not service:
-        service = get_drive_service()
-
+    service = get_drive_service()
     filename = os.path.basename(filepath)
 
-    file_metadata = {
-        'name': filename,
-        'mimeType': 'video/mp4'
-    }
-    if folder_id:
-        file_metadata['parents'] = [folder_id]
+    file_metadata = {'name': filename, 'mimeType': 'video/mp4'}
+    if os.getenv("DRIVE_FOLDER_ID"):
+        file_metadata['parents'] = [os.getenv("DRIVE_FOLDER_ID")]
 
-    media = MediaFileUpload(
-        filepath,
-        mimetype='video/mp4',
-        resumable=True,
-        chunksize=50 * 1024 * 1024
-    )
+    media = MediaFileUpload(filepath, mimetype='video/mp4', resumable=True)
 
     try:
         file = service.files().create(
@@ -73,7 +69,6 @@ def upload_to_drive(filepath: str, folder_id=None, service=None):
             media_body=media,
             fields='id, name, webViewLink'
         ).execute()
-
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Uploaded → {filename}")
         print(f"Drive link: {file.get('webViewLink')}")
         return True
@@ -81,17 +76,13 @@ def upload_to_drive(filepath: str, folder_id=None, service=None):
         print(f"Upload failed: {filename} → {e}")
         return False
 
+# ──── Background upload worker ──────────────────────────────────────────────
+
 async def upload_worker():
-    service = get_drive_service()
     while True:
         if not upload_queue.empty():
             path = upload_queue.get()
-            success = upload_to_drive(
-                path,
-                folder_id=os.getenv("DRIVE_FOLDER_ID"),
-                service=service
-            )
-            if success:
+            if upload_to_drive(path):
                 try:
                     os.remove(path)
                 except:
@@ -100,6 +91,8 @@ async def upload_worker():
         else:
             await asyncio.sleep(3)
 
+# ──── Event handler ─────────────────────────────────────────────────────────
+
 @client.on(events.NewMessage(chats=TARGET_CHANNEL))
 async def new_video_handler(event):
     global video_counter
@@ -107,7 +100,7 @@ async def new_video_handler(event):
     if not event.video:
         return
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] New video detected")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] New video detected in {TARGET_CHANNEL}")
 
     path = await event.download_media(file=DOWNLOAD_DIR)
     if not path:
@@ -120,42 +113,34 @@ async def new_video_handler(event):
     new_path = os.path.join(DOWNLOAD_DIR, new_filename)
 
     os.rename(path, new_path)
-    print(f"Renamed → {new_filename}")
+    print(f"Renamed to → {new_filename}")
 
     upload_queue.put(new_path)
-    print(f"Queued for upload → {new_filename}  (#{video_counter})")
+    print(f"Queued → {new_filename}  (#{video_counter})")
+
+# ──── Main startup ──────────────────────────────────────────────────────────
 
 async def main():
-    global client
-
     if not STRING_SESSION:
-        print("STRING_SESSION environment variable is missing!")
+        print("ERROR: STRING_SESSION is missing in environment variables!")
         return
 
-    client = TelegramClient(
-        StringSession(STRING_SESSION),
-        API_ID,
-        API_HASH
-    )
+    if not TARGET_CHANNEL:
+        print("WARNING: TARGET_CHANNEL not set → will listen to ALL incoming messages!")
 
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting bot (user mode) ...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting user-mode listener...")
 
     await client.start()
-    print("Session authorized successfully")
+    print("Connected and authorized successfully")
 
-    if not TARGET_CHANNEL:
-        print("Warning: TARGET_CHANNEL not set → listening to ALL chats!")
-    else:
-        print(f"Listening for new videos in: {TARGET_CHANNEL}")
-
-    # Start background upload task
-    asyncio.create_task(upload_worker())
-
-    # Keep the bot running
-    await client.run_until_disconnected()
-
-if __name__ == "__main__":
     if not os.path.exists(DOWNLOAD_DIR):
         os.makedirs(DOWNLOAD_DIR)
 
+    # Start uploader in background
+    asyncio.create_task(upload_worker())
+
+    print(f"Listening for new videos in: {TARGET_CHANNEL or 'all chats'}")
+    await client.run_until_disconnected()
+
+if __name__ == "__main__":
     asyncio.run(main())
